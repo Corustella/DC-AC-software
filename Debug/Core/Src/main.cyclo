@@ -1,0 +1,13 @@
+../Core/Src/main.c:107:5:main	2
+../Core/Src/main.c:187:6:SystemClock_Config	3
+../Core/Src/main.c:229:6:doADC	3
+../Core/Src/main.c:279:6:U_PID	3
+../Core/Src/main.c:303:6:mppt	5
+../Core/Src/main.c:337:6:Display	1
+../Core/Src/main.c:378:6:MainDutyAdjust	3
+../Core/Src/main.c:391:6:KeyToControl	17
+../Core/Src/main.c:477:6:paremeter_group_add	1
+../Core/Src/main.c:485:6:paremeter_choose_add	1
+../Core/Src/main.c:494:6:paremeter_display	13
+../Core/Src/main.c:551:6:HAL_TIM_PeriodElapsedCallback	4
+../Core/Src/main.c:572:6:Error_Handler	1

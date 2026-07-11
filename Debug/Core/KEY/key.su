@@ -1,0 +1,2 @@
+../Core/KEY/key.c:9:5:getKeyValue	16	static
+../Core/KEY/key.c:42:6:delay_us	32	static
