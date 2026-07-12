@@ -44,6 +44,24 @@
 #define MAIN_DUTY_MAX 950.0f
 #define MAIN_DEADTIME_PERCENT 2.5f
 #define MAIN_TOTAL_ON_PERCENT 95.0f
+#define VOLTAGE_INPUT_MIN 18U
+#define VOLTAGE_INPUT_MAX 24U
+#define VOLTAGE_OUTPUT_MIN 30U
+#define VOLTAGE_OUTPUT_MAX 36U
+#define VOLTAGE_CONTROL_SAMPLE_HZ 1000.0f
+#define VOLTAGE_CONTROL_KP 3.0f
+#define VOLTAGE_CONTROL_KI_PER_SAMPLE 0.020f
+#define VOLTAGE_CONTROL_FILTER_ALPHA 0.10f
+#define VOLTAGE_CONTROL_SOFTSTART_V_PER_S 2.0f
+#define VOLTAGE_CONTROL_DUTY_MARGIN 100.0f
+#define VOLTAGE_CONTROL_ABSOLUTE_MAX 650.0f
+#define CURRENT_SENSOR_V_PER_A 1.0f
+#define OVERCURRENT_TRIP_A 2.50f
+#define OVERCURRENT_RESET_A 2.20f
+#define OVERCURRENT_DEBOUNCE_SAMPLES 3U
+#define OVERVOLTAGE_MARGIN_V 2.0f
+#define OVERVOLTAGE_ABSOLUTE_V 38.0f
+#define OVERVOLTAGE_DEBOUNCE_SAMPLES 5U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -60,6 +78,13 @@ void paremeter_choose_add();
 //void paremeter_choose_sub();
 void paremeter_display();
 void MainDutyAdjust(float duty_step);
+void VoltageSettingEnter(void);
+void VoltageSettingHandleKey(int key);
+void VoltageSettingDisplay(void);
+void VoltageSettingApply(void);
+void VoltageControlStep(void);
+void VoltageControlFault(uint8_t fault_code);
+int KeyCodeToDigit(int key);
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -67,14 +92,27 @@ void MainDutyAdjust(float duty_step);
 /* USER CODE BEGIN PV */
 int mode_flag = 0,mppt_flag=0,mppt_try_flag=0,rs_flag=0;
 volatile int main_duty_manual_flag = 0;
+volatile int voltage_control_active = 0;
+volatile uint8_t voltage_control_fault = 0;
+int voltage_setting_page = 0, voltage_setting_value = 0;
+int voltage_setting_digits = 0, voltage_setting_error = 0;
+int voltage_setting_previous_mode = 0, voltage_setting_previous_manual = 0;
+int voltage_setting_previous_control = 0;
+float voltage_setting_vin = 18.0f;
+float voltage_control_duty_min = MAIN_DUTY_MIN;
+float voltage_control_duty_max = VOLTAGE_CONTROL_ABSOLUTE_MAX;
+float voltage_control_integral = 0.0f;
+float voltage_control_soft_setpoint = VOLTAGE_OUTPUT_MIN;
+uint16_t overcurrent_count = 0, overvoltage_count = 0;
+uint8_t adc_filter_initialized = 0;
 int paremeter_group_flag = 0, paremeter_choose_flag = 0, paremeter_flag = 0;
 int test;
 int key_value=0,key_value0=0;
 int time_flag=0,flag=0;
 float vol0,vol1,vol2,vol3,vol4,vref;
-uint32_t DMA_data[DMA_len];
+volatile uint32_t DMA_data[DMA_len];
 float Uo_set=30.0f,Uin_set=25.0f;
-float Uin,Iin,Uo,Us;
+volatile float Uin,Iin,Uo,Us,Iout,Uo_instant,Iout_instant;
 float Rs=10.5f,Rs1,Rs2,Rs3,Uin1,Iin1,Uin2,Iin2,Uin3,Iin3;
 float tem_err1,tem_err2,uo_b=0.0,us_b=0.0,bias1=0.3f,bias2=0.1f;
 float u1_duty=800.0,u2_duty=650.0;
@@ -155,7 +193,7 @@ int main(void)
   HAL_TIM_PWM_Start(&htim1,TIM_CHANNEL_2);
   HAL_TIMEx_PWMN_Start(&htim1,TIM_CHANNEL_2);
 
-  HAL_ADC_Start_DMA(&hadc1,DMA_data,DMA_len);//启动ADC
+  HAL_ADC_Start_DMA(&hadc1,(uint32_t *)DMA_data,DMA_len);//启动ADC
   HAL_TIM_Base_Start(&htim3);//启动定时器
 
   HAL_Delay(200);
@@ -228,6 +266,7 @@ void SystemClock_Config(void)
 /* USER CODE BEGIN 4 */
 void doADC()//mode0
 {
+	float uo_sample, iout_sample;
 //    if (time_flag < 1000)
 //    {
 //      time_flag++;
@@ -241,15 +280,31 @@ void doADC()//mode0
 	vol3=DMA_data[3];//us
 	vol4=DMA_data[4];
 
+	if(vol4<100.0f)
+		return;
 	vref=1.21f*(4095.0f/vol4);
 
 	Iin=((vol0/4095.0f)*vref)*0.9105f+0.0112f;
 //	Uo=((vol1/4095.0f)*vref)*16.147f+0.034f+uo_b;
-	Uo=((vol1/4095.0f)*vref)*20.9f;//35,45合适 50+0.1 55+0.3
+	uo_sample=((vol1/4095.0f)*vref)*20.5f;//Preserve the calibrated Uo scale.
 	Uin=((vol2/4095.0f)*vref)*16.185f-0.012f;
 	Us=((vol3/4095.0f)*vref)*20.93f+us_b;
 
-	Uo=(Us>52.0f)?(Uo+bias1):((Us>48)?(Uo+bias2):Uo);
+	uo_sample=(Us>52.0f)?(uo_sample+bias1):((Us>48)?(uo_sample+bias2):uo_sample);
+	iout_sample=((vol0/4095.0f)*vref)/CURRENT_SENSOR_V_PER_A;
+	Uo_instant = uo_sample;
+	Iout_instant = iout_sample;
+	if(!adc_filter_initialized)
+	{
+		Uo = uo_sample;
+		Iout = iout_sample;
+		adc_filter_initialized = 1;
+	}
+	else
+	{
+		Uo += VOLTAGE_CONTROL_FILTER_ALPHA*(uo_sample-Uo);
+		Iout += VOLTAGE_CONTROL_FILTER_ALPHA*(iout_sample-Iout);
+	}
 //	if(flag<2)
 //	{
 //		if(flag==0)
@@ -339,6 +394,12 @@ void Display()//x 0~127 一个6格
 	float li_duty_percent = u1_duty/10.0f-MAIN_DEADTIME_PERCENT;
 	float hi_duty_percent = MAIN_TOTAL_ON_PERCENT-li_duty_percent;
 
+	if(voltage_setting_page!=0)
+	{
+		VoltageSettingDisplay();
+		return;
+	}
+
 	OLED_ShowString(0, -1, "mode");
 	OLED_ShowNum(30, -1, mode_flag, 1, 16);
 
@@ -367,16 +428,36 @@ void Display()//x 0~127 一个6格
 	OLED_ShowString(0, 5, "Main");
 	OLED_ShowFloat(30, 5, u1_duty/10.0f, 2, 1, 12);
 	OLED_ShowChar(60, 5, '%');
+	if(voltage_control_active)
+		OLED_ShowString(72, 5, "VC");
+	else
+		OLED_ShowString(72, 5, "  ");
 
 	OLED_ShowNum(96, 5, mppt_flag, 1, 12);
 	OLED_ShowNum(112, 5, mppt_try_flag, 1, 12);
 
-	paremeter_display();
+	if(voltage_control_active)
+	{
+		OLED_ShowString(0, 6, "Set");
+		OLED_ShowNum(24, 6, (uint32_t)Uo_set, 2, 12);
+		OLED_ShowString(48, 6, "In");
+		OLED_ShowNum(66, 6, (uint32_t)Uin_set, 2, 12);
+		OLED_ShowString(90, 6, "Io");
+		OLED_ShowFloat(108, 6, Iout, 1, 1, 12);
+	}
+	else if(voltage_control_fault)
+	{
+		OLED_ShowString(0, 6, "FAULT");
+		OLED_ShowNum(42, 6, voltage_control_fault, 1, 12);
+	}
+	else
+		paremeter_display();
 
 }
 
 void MainDutyAdjust(float duty_step)
 {
+	voltage_control_active = 0;
 	main_duty_manual_flag = 1;
 	u1_duty += duty_step;
 	u1_duty = (u1_duty > MAIN_DUTY_MAX) ? MAIN_DUTY_MAX :
@@ -388,84 +469,333 @@ void MainDutyAdjust(float duty_step)
 	__HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_1, (uint16_t)(u1_duty));
 }
 
+int KeyCodeToDigit(int key)
+{
+	switch(key)
+	{
+	case 2:  return 1;
+	case 1:  return 2;
+	case 3:  return 3;
+	case 6:  return 4;
+	case 5:  return 5;
+	case 7:  return 6;
+	case 10: return 7;
+	case 9:  return 8;
+	case 11: return 9;
+	case 13: return 0;
+	default: return -1;
+	}
+}
+
+void VoltageSettingEnter(void)
+{
+	voltage_setting_previous_mode = mode_flag;
+	voltage_setting_previous_manual = main_duty_manual_flag;
+	voltage_setting_previous_control = voltage_control_active;
+	voltage_control_active = 0;
+	main_duty_manual_flag = 1;
+	voltage_setting_page = 1;
+	voltage_setting_value = 0;
+	voltage_setting_digits = 0;
+	voltage_setting_error = 0;
+	OLED_Clear();
+}
+
+void VoltageSettingApply(void)
+{
+	float duty_percent = (1.0f-Uin_set/Uo_set)*100.0f+MAIN_DEADTIME_PERCENT;
+
+	u1_duty = duty_percent*10.0f;
+	u1_duty = (u1_duty > MAIN_DUTY_MAX) ? MAIN_DUTY_MAX :
+			  ((u1_duty < MAIN_DUTY_MIN) ? MAIN_DUTY_MIN : u1_duty);
+	voltage_control_duty_min = MAIN_DUTY_MIN;
+	voltage_control_duty_max = u1_duty+VOLTAGE_CONTROL_DUTY_MARGIN;
+	voltage_control_duty_max = (voltage_control_duty_max>VOLTAGE_CONTROL_ABSOLUTE_MAX) ?
+						   VOLTAGE_CONTROL_ABSOLUTE_MAX : voltage_control_duty_max;
+	voltage_control_integral = 0.0f;
+	voltage_control_soft_setpoint = Uo;
+	if(voltage_control_soft_setpoint<Uin_set)
+		voltage_control_soft_setpoint = Uin_set;
+	if(voltage_control_soft_setpoint>Uo_set)
+		voltage_control_soft_setpoint = Uo_set;
+	voltage_control_fault = 0;
+	overcurrent_count = 0;
+	overvoltage_count = 0;
+	__HAL_TIM_MOE_ENABLE(&htim1);
+	/* Start at minimum duty; feed-forward follows the ramped reference. */
+	u1_duty = MAIN_DUTY_MIN;
+	u1_loop.out = u1_duty;
+	u1_loop.out_last = u1_duty;
+	__HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_1, (uint16_t)u1_duty);
+
+	/* Use the new voltage controller without changing the legacy MODE1 loops. */
+	mode_flag = 0;
+	main_duty_manual_flag = 1;
+	voltage_control_active = 1;
+	voltage_setting_page = 0;
+	OLED_Clear();
+}
+
+void VoltageSettingHandleKey(int key)
+{
+	int digit;
+
+	if(key==16) /* D: cancel */
+	{
+		mode_flag = voltage_setting_previous_mode;
+		main_duty_manual_flag = voltage_setting_previous_manual;
+		voltage_control_active = voltage_setting_previous_control;
+		voltage_setting_page = 0;
+		OLED_Clear();
+		return;
+	}
+
+	if(key==14) /* *: backspace */
+	{
+		if(voltage_setting_digits>0)
+		{
+			voltage_setting_value /= 10;
+			voltage_setting_digits--;
+		}
+		voltage_setting_error = 0;
+		return;
+	}
+
+	if(key==15) /* #: confirm */
+	{
+		if(voltage_setting_digits==0)
+		{
+			voltage_setting_error = 1;
+			return;
+		}
+
+		if(voltage_setting_page==1)
+		{
+			if(voltage_setting_value<(int)VOLTAGE_INPUT_MIN ||
+			   voltage_setting_value>(int)VOLTAGE_INPUT_MAX)
+			{
+				voltage_setting_error = 1;
+				return;
+			}
+			voltage_setting_vin = (float)voltage_setting_value;
+			voltage_setting_page = 2;
+			voltage_setting_value = 0;
+			voltage_setting_digits = 0;
+			voltage_setting_error = 0;
+			OLED_Clear();
+			return;
+		}
+
+		if(voltage_setting_value<(int)VOLTAGE_OUTPUT_MIN ||
+		   voltage_setting_value>(int)VOLTAGE_OUTPUT_MAX ||
+		   (float)voltage_setting_value<=voltage_setting_vin)
+		{
+			voltage_setting_error = 1;
+			return;
+		}
+
+		Uin_set = voltage_setting_vin;
+		Uo_set = (float)voltage_setting_value;
+		VoltageSettingApply();
+		return;
+	}
+
+	digit = KeyCodeToDigit(key);
+	if(digit>=0 && voltage_setting_digits<2)
+	{
+		voltage_setting_value = voltage_setting_value*10+digit;
+		voltage_setting_digits++;
+		voltage_setting_error = 0;
+	}
+}
+
+void VoltageSettingDisplay(void)
+{
+	OLED_ShowString(0, 0, "DC-DC SET");
+	if(voltage_setting_page==1)
+	{
+		OLED_ShowString(0, 1, "VIN 18-24V");
+		OLED_ShowString(0, 3, "VIN:");
+	}
+	else
+	{
+		OLED_ShowString(0, 1, "VIN:");
+		OLED_ShowNum(30, 1, (uint32_t)voltage_setting_vin, 2, 12);
+		OLED_ShowString(0, 2, "OUT 30-36V");
+		OLED_ShowString(0, 3, "OUT:");
+	}
+
+	if(voltage_setting_digits==0)
+		OLED_ShowString(36, 3, "--");
+	else
+		OLED_ShowNum(36, 3, (uint32_t)voltage_setting_value,
+					 voltage_setting_digits, 16);
+
+	if(voltage_setting_error)
+		OLED_ShowString(0, 5, "RANGE ERROR");
+	else
+		OLED_ShowString(0, 5, "           ");
+	OLED_ShowString(0, 6, "#OK *DEL DEXIT");
+}
+
+void VoltageControlStep(void)
+{
+	float error, feedforward, proportional, unsaturated, next_integral;
+	float overvoltage_limit = Uo_set+OVERVOLTAGE_MARGIN_V;
+
+	if(!voltage_control_active || voltage_setting_page!=0)
+		return;
+
+	/* INA282 gain 50 V/V and 20 mOhm shunt give approximately 1 V/A. */
+	if(Iout_instant>=OVERCURRENT_TRIP_A)
+		overcurrent_count++;
+	else if(Iout_instant<=OVERCURRENT_RESET_A)
+		overcurrent_count = 0;
+	if(overcurrent_count>=OVERCURRENT_DEBOUNCE_SAMPLES)
+	{
+		VoltageControlFault(1);
+		return;
+	}
+
+	if(overvoltage_limit>OVERVOLTAGE_ABSOLUTE_V)
+		overvoltage_limit = OVERVOLTAGE_ABSOLUTE_V;
+	if(Uo_instant>=overvoltage_limit)
+		overvoltage_count++;
+	else
+		overvoltage_count = 0;
+	if(overvoltage_count>=OVERVOLTAGE_DEBOUNCE_SAMPLES)
+	{
+		VoltageControlFault(2);
+		return;
+	}
+
+	if(voltage_control_soft_setpoint<Uo_set)
+	{
+		voltage_control_soft_setpoint += VOLTAGE_CONTROL_SOFTSTART_V_PER_S/
+									 VOLTAGE_CONTROL_SAMPLE_HZ;
+		if(voltage_control_soft_setpoint>Uo_set)
+			voltage_control_soft_setpoint = Uo_set;
+	}
+
+	feedforward = (1.0f-Uin_set/voltage_control_soft_setpoint)*1000.0f+
+				  MAIN_DEADTIME_PERCENT*10.0f;
+	error = voltage_control_soft_setpoint-Uo;
+	proportional = VOLTAGE_CONTROL_KP*error;
+	next_integral = voltage_control_integral+VOLTAGE_CONTROL_KI_PER_SAMPLE*error;
+	unsaturated = feedforward+proportional+next_integral;
+
+	/* Conditional integration prevents wind-up at either duty limit. */
+	if((unsaturated<voltage_control_duty_max && unsaturated>voltage_control_duty_min) ||
+	   (unsaturated>=voltage_control_duty_max && error<0.0f) ||
+	   (unsaturated<=voltage_control_duty_min && error>0.0f))
+		voltage_control_integral = next_integral;
+
+	u1_duty = feedforward+proportional+voltage_control_integral;
+	u1_duty = (u1_duty>voltage_control_duty_max) ? voltage_control_duty_max :
+			  ((u1_duty<voltage_control_duty_min) ? voltage_control_duty_min : u1_duty);
+	u1_loop.out = u1_duty;
+	u1_loop.out_last = u1_duty;
+	__HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_1, (uint16_t)u1_duty);
+}
+
+void VoltageControlFault(uint8_t fault_code)
+{
+	voltage_control_fault = fault_code;
+	voltage_control_active = 0;
+	main_duty_manual_flag = 1;
+	__HAL_TIM_MOE_DISABLE_UNCONDITIONALLY(&htim1);
+}
+
 void KeyToControl(int key)
 {
-//2 6 10 14 ; 1 5 9 13 ; 3 7 11 15;  4 8 12 16
+	if(voltage_setting_page!=0)
+	{
+		VoltageSettingHandleKey(key);
+		return;
+	}
+
+/* Physical layout (key code): 1(2) 2(1) 3(3) A(4)
+ *                             4(6) 5(5) 6(7) B(8)
+ *                             7(10)8(9) 9(11)C(12)
+ *                             *(14)0(13)#(15)D(16) */
   switch (key)
   {
-  case 2://1
+  case 2://physical 1: MODE0
 	  mode_flag = 0;
 	  main_duty_manual_flag = 0;
+	  voltage_control_active = 0;
 	  test=1;
 	  u1_duty=800;
 	  u2_duty=650;
 	  __HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_1, (uint16_t)(u1_duty));
 	  __HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_2, (uint16_t)(u2_duty));
     break;
-  case 6://2
+  case 6://physical 4: MODE1
 	  test=2;
 	  main_duty_manual_flag = 0;
+	  voltage_control_active = 0;
 	  mode_flag = 1;
     break;
-  case 10://3
+  case 10://physical 7
 	  rs_flag=1-rs_flag;
 	  test=3;
     break;
-  case 14://4 / A: main duty +1%
+  case 14://physical *: reserved
 	  test=4;
-	  MainDutyAdjust(MAIN_DUTY_STEP);
     break;
-  case 1://5
+  case 1://physical 2
 	  *paremeter[paremeter_flag] += 50;
 	  __HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_1, (uint16_t)(u1_duty));
 	  __HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_2, (uint16_t)(u2_duty));
 	  test=5;
     break;
-  case 5: //6
+  case 5: //physical 5
 	  *paremeter[paremeter_flag] -= 50;
 	  __HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_1, (uint16_t)(u1_duty));
 	  __HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_2, (uint16_t)(u2_duty));
 	  test=6;
 	break;
-  case 9: //7
+  case 9: //physical 8
 	  test=7;
       *paremeter[paremeter_flag] += 10;
 	  __HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_1, (uint16_t)(u1_duty));
 	  __HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_2, (uint16_t)(u2_duty));
     break;
-  case 13://8 / B: main duty -1%
+  case 13://physical 0
 	  test=8;
-	  MainDutyAdjust(-MAIN_DUTY_STEP);
+	  *paremeter[paremeter_flag] -= 10;
+	  __HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_1, (uint16_t)(u1_duty));
+	  __HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_2, (uint16_t)(u2_duty));
     break;
-  case 3://9
+  case 3://physical 3: enter voltage setting page
 	  test=9;
-	  *paremeter[paremeter_flag] += 1;
+	  VoltageSettingEnter();
     break;
-  case 7:
+  case 7://physical 6
 	  test=10;
 	  *paremeter[paremeter_flag] -= 1;
     break;
-  case 11:
+  case 11://physical 9
 	  test=11;
 	  *paremeter[paremeter_flag] += 0.1;
     break;
-  case 15:
+  case 15://physical #
 	  test=12;
 	  *paremeter[paremeter_flag] -= 0.1;
     break;
-  case 4:
+  case 4://physical A: main duty +1%
 	  test=13;
-	  *paremeter[paremeter_flag] += 0.01;
+	  MainDutyAdjust(MAIN_DUTY_STEP);
     break;
-  case 8:
+  case 8://physical B: main duty -1%
 	  test=14;
-	  *paremeter[paremeter_flag] -= 0.01;
+	  MainDutyAdjust(-MAIN_DUTY_STEP);
     break;
-  case 12:
+  case 12://physical C
 	  test=15;
 	  paremeter_group_add();
     break;
-  case 16:
+  case 16://physical D
 	  test=16;Rs-=0.1;
 	  paremeter_choose_add();
     break;
@@ -553,8 +883,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) // 涓柇鏈嶅�
   if (htim->Instance == TIM2)
   {
 //    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET);
-    void *p = model_func_pointer[mode_flag];
-    (*(unsigned int (*)(void))p)();
+	if(!voltage_control_active)
+	{
+	  void *p = model_func_pointer[mode_flag];
+	  (*(unsigned int (*)(void))p)();
+	}
 //    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET);
   }
 
@@ -562,6 +895,15 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) // 涓柇鏈嶅�
   {
 	  mppt();
   }
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+	if(hadc->Instance==ADC1)
+	{
+		doADC();
+		VoltageControlStep();
+	}
 }
 /* USER CODE END 4 */
 
