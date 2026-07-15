@@ -148,6 +148,11 @@ volatile uint8_t inverter_frequency_page = 0;
 volatile uint8_t inverter_voltage_page = 0;
 volatile uint8_t inverter_softstart_done = 0;
 volatile uint8_t inverter_peak_count = 0;
+volatile uint8_t inverter_hiccup_active = 0;
+volatile uint8_t inverter_hiccup_retries = 0;
+volatile uint8_t inverter_hiccup_latched = 0;
+volatile uint32_t inverter_hiccup_cooldown_ticks = 0;
+volatile uint32_t inverter_hiccup_window_ticks = 0;
 volatile uint16_t inverter_frequency_hz = INVERTER_FREQUENCY_DEFAULT;
 volatile uint16_t inverter_target_rms_v = INVERTER_OUTPUT_RMS_DEFAULT;
 uint16_t inverter_target_edit_v = INVERTER_OUTPUT_RMS_DEFAULT;
@@ -845,8 +850,10 @@ void InverterStart(uint8_t closed_loop)
 	inverter_softstart_done = 0;
 	inverter_peak_count = 0;
 	inverter_hiccup_active = 0;
+	inverter_hiccup_retries = 0;
 	inverter_hiccup_latched = 0;
 	inverter_hiccup_cooldown_ticks = 0;
+	inverter_hiccup_window_ticks = 0;
 	voltage_control_active = 0;
 	voltage_setting_page = 0;
 	inverter_phase = 0;
@@ -864,6 +871,7 @@ void InverterStart(uint8_t closed_loop)
 	__HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_1, 500U);
 	__HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_2, 500U);
 	__HAL_TIM_MOE_ENABLE(&htim1);
+	OLED_Clear();
 }
 
 void InverterStop(uint8_t clear_fault)
@@ -892,13 +900,12 @@ void InverterFault(void)
 void InverterHiccupStart(void)
 {
 	/* Enter hiccup cooldown: shut off PWM, schedule auto-restart. */
+	if(inverter_hiccup_retries<255U)
+		inverter_hiccup_retries++;
 	inverter_hiccup_active = 1;
 	inverter_hiccup_latched = 0;
 	inverter_hiccup_cooldown_ticks = INVERTER_HICCUP_COOLDOWN_TICKS;
 	InverterStop(0);
-	/* Increment after InverterStop to avoid double-count from re-entrant ADC ISR. */
-	if(inverter_hiccup_retries<255U)
-		inverter_hiccup_retries++;
 }
 
 void InverterHiccupStep(void)
@@ -913,16 +920,9 @@ void InverterHiccupStep(void)
 		return;
 	}
 
-	/* Cooldown expired: retry, latch, or wait for user. */
+	/* Cooldown expired: retry or latch. */
 	if(inverter_hiccup_retries>INVERTER_HICCUP_MAX_RETRIES)
 	{
-		inverter_hiccup_latched = 1;
-		inverter_hiccup_active = 0;
-		InverterFault();
-	}
-	else if(inverter_frequency_page || inverter_voltage_page)
-	{
-		/* User in settings page; latch so state is visible on return. */
 		inverter_hiccup_latched = 1;
 		inverter_hiccup_active = 0;
 		InverterFault();
@@ -1065,7 +1065,7 @@ void InverterAdcStep(void)
 		inverter_rms_samples = 0;
 		if(inverter_current_rms>=INVERTER_CURRENT_RMS_TRIP_A)
 		{
-			InverterFault();
+			InverterHiccupStart();
 			return;
 		}
 		InverterPidStep();
@@ -1093,8 +1093,6 @@ void InverterFrequencyHandleKey(int key)
 		inverter_closed_loop = 1;
 	else if(key==15) /* #: run selected mode */
 	{
-		inverter_hiccup_retries = 0;
-		inverter_hiccup_window_ticks = 0;
 		InverterStart(inverter_closed_loop);
 		return;
 	}
@@ -1142,8 +1140,6 @@ void InverterVoltageHandleKey(int key)
 		inverter_closed_loop = 1;
 	else if(key==15) /* #: apply and run selected mode */
 	{
-			inverter_hiccup_retries = 0;
-			inverter_hiccup_window_ticks = 0;
 		inverter_target_rms_v = inverter_target_edit_v;
 		InverterStart(inverter_closed_loop);
 		return;
@@ -1187,16 +1183,16 @@ void InverterDisplay(void)
 	OLED_ShowString(0, 5, "Set:");
 	OLED_ShowNum(30, 5, inverter_target_rms_v, 2, 12);
 	OLED_ShowString(48, 5, "V");
-	if(inverter_hiccup_latched)
-		OLED_ShowString(66, 5, "LATCH!");
-	else if(inverter_fault)
+	if(inverter_fault)
 		OLED_ShowString(78, 5, "OC!");
+	else if(inverter_hiccup_latched)
+		OLED_ShowString(66, 5, "LATCH!");
 	OLED_ShowString(0, 6, inverter_hiccup_active ? "COOL.." : "3:V *:F D:STOP");
 	if(inverter_hiccup_active)
 	{
-		OLED_ShowNum(60, 6, (inverter_hiccup_cooldown_ticks+(INVERTER_PWM_UPDATE_HZ/10U)-1U)/(INVERTER_PWM_UPDATE_HZ/10U), 3, 12);
+		OLED_ShowNum(60, 6, inverter_hiccup_cooldown_ticks/(INVERTER_PWM_UPDATE_HZ/10U), 3, 12);
 		OLED_ShowString(90, 6, "R");
-		OLED_ShowNum(102, 6, inverter_hiccup_retries, 3, 12);
+		OLED_ShowNum(102, 6, inverter_hiccup_retries, 1, 12);
 	}
 }
 
@@ -1222,15 +1218,11 @@ void KeyToControl(int key)
 
 	if(key==2) /* physical 1: inverter MODE0 open loop */
 	{
-		inverter_hiccup_retries = 0;
-		inverter_hiccup_window_ticks = 0;
 		InverterStart(0);
 		return;
 	}
 	if(key==1) /* physical 2: inverter MODE1 closed loop */
 	{
-		inverter_hiccup_retries = 0;
-		inverter_hiccup_window_ticks = 0;
 		InverterStart(1);
 		return;
 	}
@@ -1247,11 +1239,7 @@ void KeyToControl(int key)
 	if(inverter_ui_selected)
 	{
 		if(key==15)
-		{
-			inverter_hiccup_retries = 0;
-			inverter_hiccup_window_ticks = 0;
 			InverterStart(inverter_closed_loop);
-		}
 		else if(key==16)
 			InverterStop(1);
 		InverterUpdatePhaseStep();
@@ -1434,10 +1422,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) // 涓柇鏈嶅�
 	else if(inverter_hiccup_active)
 	{
 	  InverterHiccupStep();
-	}
-	else if(inverter_hiccup_latched)
-	{
-	  /* Permanent latch; remain idle until manual restart. */
 	}
 	else if(!voltage_control_active)
 	{
