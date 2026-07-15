@@ -77,7 +77,7 @@
 #define INVERTER_MODULATION_MAX 1.00f
 #define INVERTER_MODULATION_RAMP_STEP 0.00010f
 /* Power-analyzer fine calibration: 21.20 Vrms actual corresponded to 20.93 Vrms OLED. */
-#define INVERTER_VOLTAGE_SCALE 65.430f
+#define INVERTER_VOLTAGE_SCALE 62.0f
 /* Power-analyzer calibration: 2.10 Arms actual corresponded to 1.99 Arms OLED. */
 #define INVERTER_CURRENT_SCALE 3.4508f
 #define INVERTER_ADC_MID_DEFAULT 1.69f
