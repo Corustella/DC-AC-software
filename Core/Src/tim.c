@@ -89,8 +89,8 @@ void MX_TIM1_Init(void)
   sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_ENABLE;
   sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_ENABLE;
   sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
-  /* DTG=0xA4: about 1.25 us per transition at 160 MHz (95% total on-time at 20 kHz). */
-  sBreakDeadTimeConfig.DeadTime = 164;
+  /* DTG=0x90: about 1.00 us per transition at a 160 MHz timer clock. */
+  sBreakDeadTimeConfig.DeadTime = 144;
   sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
   sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
   sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;

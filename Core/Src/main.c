@@ -67,21 +67,24 @@
 #define INVERTER_FREQUENCY_MIN 20U
 #define INVERTER_FREQUENCY_MAX 100U
 #define INVERTER_FREQUENCY_DEFAULT 50U
+#define INVERTER_DISPLAY_REFRESH_MS 200U
 #define INVERTER_OUTPUT_RMS_MIN 18U
 #define INVERTER_OUTPUT_RMS_MAX 25U
-#define INVERTER_OUTPUT_RMS_DEFAULT 18U
+#define INVERTER_OUTPUT_RMS_DEFAULT 21U
+#define INVERTER_TEST_FREQUENCY_HZ 50U
+#define INVERTER_TEST_OUTPUT_RMS_V 21U
 #define INVERTER_MODULATION_MIN 0.05f
 #define INVERTER_MODULATION_MAX 1.00f
 #define INVERTER_MODULATION_RAMP_STEP 0.00010f
-/* 28 Vpp at the load produced 0.45 Vpp on PA1: 28/0.45 = 62.222 V/V. */
-#define INVERTER_VOLTAGE_SCALE 62.2222f
-/* CT-TA1015-2M: 5 Arms -> 2.5 mArms, with the module's 240 ohm feedback. */
-#define INVERTER_CURRENT_SCALE 8.3333f
+/* Power-analyzer fine calibration: 21.20 Vrms actual corresponded to 20.93 Vrms OLED. */
+#define INVERTER_VOLTAGE_SCALE 65.430f
+/* Power-analyzer calibration: 2.10 Arms actual corresponded to 1.99 Arms OLED. */
+#define INVERTER_CURRENT_SCALE 3.4508f
 #define INVERTER_ADC_MID_DEFAULT 1.69f
 #define INVERTER_MID_FILTER_ALPHA 0.00020f
-#define INVERTER_CURRENT_RMS_TRIP_A 2.0f
-#define INVERTER_CURRENT_PEAK_TRIP_A 3.0f
-#define INVERTER_PEAK_DEBOUNCE_SAMPLES 3U
+#define INVERTER_CURRENT_RMS_TRIP_A 2.55f
+#define INVERTER_CURRENT_PEAK_TRIP_A 5.00f
+#define INVERTER_PEAK_DEBOUNCE_SAMPLES 5U
 #define INVERTER_PID_KP 0.040f
 #define INVERTER_PID_KI 0.400f
 #define INVERTER_PID_KD 0.001f
@@ -123,6 +126,7 @@ void InverterVoltageHandleKey(int key);
 void InverterVoltageDisplay(void);
 void InverterUpdatePhaseStep(void);
 void InverterSetModulation(float modulation);
+void InverterProfileToggle(void);
 float InverterFeedforwardModulation(void);
 /* USER CODE END PM */
 
@@ -134,9 +138,10 @@ volatile int main_duty_manual_flag = 0;
 volatile int voltage_control_active = 0;
 volatile uint8_t voltage_control_fault = 0;
 volatile uint8_t inverter_active = 0;
-volatile uint8_t inverter_closed_loop = 0;
+volatile uint8_t inverter_closed_loop = 1;
 volatile uint8_t inverter_fault = 0;
-volatile uint8_t inverter_ui_selected = 0;
+volatile uint8_t inverter_ui_selected = 1;
+volatile uint8_t inverter_test_profile = 1;
 volatile uint8_t inverter_frequency_page = 0;
 volatile uint8_t inverter_voltage_page = 0;
 volatile uint8_t inverter_softstart_done = 0;
@@ -144,6 +149,11 @@ volatile uint8_t inverter_peak_count = 0;
 volatile uint16_t inverter_frequency_hz = INVERTER_FREQUENCY_DEFAULT;
 volatile uint16_t inverter_target_rms_v = INVERTER_OUTPUT_RMS_DEFAULT;
 uint16_t inverter_target_edit_v = INVERTER_OUTPUT_RMS_DEFAULT;
+uint16_t inverter_test_frequency_hz = INVERTER_TEST_FREQUENCY_HZ;
+uint16_t inverter_adj_frequency_hz = INVERTER_FREQUENCY_DEFAULT;
+uint16_t inverter_adj_target_rms_v = INVERTER_OUTPUT_RMS_DEFAULT;
+uint8_t inverter_adj_closed_loop = 0;
+uint32_t display_last_refresh_ms = 0;
 volatile uint32_t inverter_phase = 0;
 volatile uint32_t inverter_adc_phase = 0;
 volatile uint32_t inverter_phase_step = 0;
@@ -282,7 +292,11 @@ int main(void)
 		{
 		  KeyToControl(key_value);
 		}
-		Display();
+		if((uint32_t)(HAL_GetTick()-display_last_refresh_ms)>=INVERTER_DISPLAY_REFRESH_MS)
+		{
+			display_last_refresh_ms = HAL_GetTick();
+			Display();
+		}
   }
   /* USER CODE END 3 */
 }
@@ -813,12 +827,50 @@ void InverterSetModulation(float modulation)
 	inverter_modulation_command = modulation;
 }
 
+void InverterProfileToggle(void)
+{
+	InverterStop(1);
+	if(inverter_test_profile)
+	{
+		inverter_test_frequency_hz = inverter_frequency_hz;
+		inverter_test_profile = 0;
+		inverter_frequency_hz = inverter_adj_frequency_hz;
+		inverter_target_rms_v = inverter_adj_target_rms_v;
+		inverter_closed_loop = inverter_adj_closed_loop;
+	}
+	else
+	{
+		inverter_adj_frequency_hz = inverter_frequency_hz;
+		inverter_adj_target_rms_v = inverter_target_rms_v;
+		inverter_adj_closed_loop = inverter_closed_loop;
+		inverter_test_profile = 1;
+		inverter_frequency_hz = inverter_test_frequency_hz;
+		inverter_target_rms_v = INVERTER_TEST_OUTPUT_RMS_V;
+		inverter_closed_loop = 1;
+	}
+	mode_flag = inverter_closed_loop ? 1 : 0;
+	inverter_target_edit_v = inverter_target_rms_v;
+	inverter_frequency_page = 0;
+	inverter_voltage_page = 0;
+	voltage_setting_page = 0;
+	inverter_ui_selected = 1;
+	InverterUpdatePhaseStep();
+	OLED_Clear();
+}
+
 void InverterStart(uint8_t closed_loop)
 {
 	float sample_vref = 3.3f;
 	float voltage_mid, current_mid;
 
 	__HAL_TIM_MOE_DISABLE_UNCONDITIONALLY(&htim1);
+	if(inverter_test_profile)
+	{
+		inverter_test_frequency_hz = inverter_frequency_hz;
+		inverter_target_rms_v = INVERTER_TEST_OUTPUT_RMS_V;
+		inverter_target_edit_v = INVERTER_TEST_OUTPUT_RMS_V;
+		closed_loop = 1;
+	}
 	if(DMA_data[4]>100U)
 		sample_vref = 1.21f*(4095.0f/(float)DMA_data[4]);
 	voltage_mid = ((float)DMA_data[1]/4095.0f)*sample_vref;
@@ -1013,12 +1065,14 @@ void InverterFrequencyHandleKey(int key)
 		inverter_frequency_hz++;
 	else if(key==8 && inverter_frequency_hz>INVERTER_FREQUENCY_MIN) /* B: -1 Hz */
 		inverter_frequency_hz--;
-	else if(key==2) /* 1: MODE0 */
+	else if(!inverter_test_profile && key==2) /* 1: MODE0 in ADJ profile */
 		inverter_closed_loop = 0;
-	else if(key==1) /* 2: MODE1 */
+	else if(!inverter_test_profile && key==1) /* 2: MODE1 in ADJ profile */
 		inverter_closed_loop = 1;
 	else if(key==15) /* #: run selected mode */
 	{
+		if(inverter_test_profile)
+			inverter_test_frequency_hz = inverter_frequency_hz;
 		InverterStart(inverter_closed_loop);
 		return;
 	}
@@ -1092,7 +1146,10 @@ void InverterVoltageDisplay(void)
 
 void InverterDisplay(void)
 {
-	OLED_ShowString(0, 0, inverter_closed_loop ? "INV MODE1 PID" : "INV MODE0 OPEN");
+	if(inverter_test_profile)
+		OLED_ShowString(0, 0, "TEST MODE1 PID");
+	else
+		OLED_ShowString(0, 0, inverter_closed_loop ? "ADJ MODE1 PID" : "ADJ MODE0 OPEN");
 	OLED_ShowString(0, 1, "F:");
 	OLED_ShowNum(18, 1, inverter_frequency_hz, 3, 12);
 	OLED_ShowString(42, 1, "Hz");
@@ -1111,11 +1168,20 @@ void InverterDisplay(void)
 	OLED_ShowString(48, 5, "V");
 	if(inverter_fault)
 		OLED_ShowString(78, 5, "OC!");
-	OLED_ShowString(0, 6, "3:V *:F D:STOP");
+	if(inverter_test_profile)
+		OLED_ShowString(0, 6, "6:F C:ADJ #:RUN");
+	else
+		OLED_ShowString(0, 6, "6:F 3:V C:TEST");
 }
 
 void KeyToControl(int key)
 {
+	if(key==12) /* physical C: safely switch TEST/ADJ profile */
+	{
+		InverterProfileToggle();
+		return;
+	}
+
 	if(inverter_voltage_page)
 	{
 		InverterVoltageHandleKey(key);
@@ -1125,6 +1191,17 @@ void KeyToControl(int key)
 	if(inverter_frequency_page)
 	{
 		InverterFrequencyHandleKey(key);
+		return;
+	}
+
+	if(inverter_test_profile)
+	{
+		if(key==7) /* physical 6: frequency page */
+			InverterFrequencyEnter();
+		else if(key==15) /* #: run 21 Vrms / MODE1 at the selected frequency */
+			InverterStart(1);
+		else if(key==16) /* D: stop and clear fault */
+			InverterStop(1);
 		return;
 	}
 
@@ -1144,7 +1221,7 @@ void KeyToControl(int key)
 		InverterStart(1);
 		return;
 	}
-	if(key==14) /* physical *: frequency page */
+	if(key==7 || key==14) /* physical 6 or *: frequency page */
 	{
 		InverterFrequencyEnter();
 		return;
